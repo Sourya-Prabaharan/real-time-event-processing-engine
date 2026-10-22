@@ -17,6 +17,7 @@ import (
 	"github.com/sourya/streamflow/internal/events"
 	"github.com/sourya/streamflow/internal/metrics"
 	"github.com/sourya/streamflow/internal/storage"
+	"github.com/sourya/streamflow/internal/web"
 )
 
 func main() {
@@ -55,6 +56,10 @@ func main() {
 	dlqStore := storage.NewDLQStore(db)
 
 	mux := http.NewServeMux()
+
+	// Embedded Operational Dashboard
+	mux.Handle("GET /{$}", web.Handler())
+	mux.Handle("GET /dashboard", web.Handler())
 
 	// Prometheus metrics scraping endpoint
 	mux.Handle("GET /metrics", metrics.Handler())
