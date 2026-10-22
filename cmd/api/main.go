@@ -15,6 +15,7 @@ import (
 
 	"github.com/sourya/streamflow/internal/cache"
 	"github.com/sourya/streamflow/internal/events"
+	"github.com/sourya/streamflow/internal/metrics"
 	"github.com/sourya/streamflow/internal/storage"
 )
 
@@ -54,6 +55,9 @@ func main() {
 	dlqStore := storage.NewDLQStore(db)
 
 	mux := http.NewServeMux()
+
+	// Prometheus metrics scraping endpoint
+	mux.Handle("GET /metrics", metrics.Handler())
 
 	// Health check — always returns 200 if the process is running.
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {

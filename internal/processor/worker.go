@@ -10,6 +10,7 @@ import (
 
 	"github.com/sourya/streamflow/internal/events"
 	streamkafka "github.com/sourya/streamflow/internal/kafka"
+	"github.com/sourya/streamflow/internal/metrics"
 	"github.com/sourya/streamflow/internal/retry"
 )
 
@@ -203,6 +204,10 @@ func (w *Worker) handleMessage(ctx context.Context, msg streamkafka.Message) {
 	w.latencies.Record(elapsed)
 	w.processed.Add(1)
 
+	// Prometheus metrics
+	metrics.EventsProcessedTotal.WithLabelValues(string(event.Type), "success").Inc()
+	metrics.ProcessingDurationSeconds.WithLabelValues(string(event.Type)).Observe(elapsed.Seconds())
+
 	if w.processed.Load()%5000 == 0 {
 		p50, p95, p99 := w.latencies.Percentiles()
 		slog.Info("processing milestone",
@@ -221,6 +226,10 @@ func (w *Worker) handleMessage(ctx context.Context, msg streamkafka.Message) {
 func (w *Worker) routeToDLQ(ctx context.Context, msg streamkafka.Message, reason string) {
 	w.errors.Add(1)
 	w.dlqCount.Add(1)
+
+	metrics.EventsProcessedTotal.WithLabelValues("unknown", "failure").Inc()
+	metrics.DeadLetterEventsTotal.WithLabelValues(reason).Inc()
+
 	slog.Warn("routing message to dead-letter queue",
 		"topic", msg.Topic,
 		"partition", msg.Partition,
