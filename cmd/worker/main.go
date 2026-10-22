@@ -8,10 +8,10 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
-	"github.com/sourya/streamflow/internal/events"
+	"github.com/sourya/streamflow/internal/cache"
 	streamkafka "github.com/sourya/streamflow/internal/kafka"
+	"github.com/sourya/streamflow/internal/processor"
 	"github.com/sourya/streamflow/internal/storage"
 )
 
@@ -19,14 +19,17 @@ func main() {
 	var (
 		broker     = flag.String("broker", "localhost:9092", "Kafka broker address")
 		dbDSN      = flag.String("db", "postgres://streamflow:streamflow@localhost:5432/streamflow?sslmode=disable", "PostgreSQL DSN")
+		redisAddr  = flag.String("redis", "localhost:6379", "Redis address")
 		migrations = flag.String("migrations", "migrations", "Path to migration files")
 		group      = flag.String("group", "streamflow-workers", "Kafka consumer group ID")
+		workers    = flag.Int("workers", 4, "Number of concurrent processing goroutines")
 	)
 	flag.Parse()
 
 	slog.Info("starting worker",
 		"broker", *broker,
 		"group", *group,
+		"workers", *workers,
 	)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -46,68 +49,27 @@ func main() {
 	}
 	slog.Info("database ready")
 
+	// Connect to Redis.
+	redisCache, err := cache.NewRedisCache(*redisAddr)
+	if err != nil {
+		// Redis is optional — the system works without it, just without
+		// real-time counters. Log and continue.
+		slog.Warn("redis unavailable, running without cache", "error", err)
+		redisCache = nil
+	} else {
+		defer redisCache.Close()
+		slog.Info("redis connected")
+	}
+
 	store := storage.NewEventStore(db)
 	consumer := streamkafka.NewConsumer([]string{*broker}, *group)
 	defer consumer.Close()
 
-	var processed, errors int
-	for {
-		msg, err := consumer.FetchMessage(ctx)
-		if err != nil {
-			if ctx.Err() != nil {
-				break // shutdown signal
-			}
-			slog.Error("fetch message", "error", err)
-			time.Sleep(time.Second) // brief backoff before retry
-			continue
-		}
-
-		event, err := events.Unmarshal(msg.Value)
-		if err != nil {
-			slog.Error("unmarshal event", "error", err, "offset", msg.Offset, "partition", msg.Partition)
-			// Commit the offset anyway — a malformed message won't become valid
-			// on retry. In Phase 3 we'll route these to a dead-letter topic.
-			if err := consumer.CommitMessage(ctx, msg); err != nil {
-				slog.Error("commit bad message", "error", err)
-			}
-			errors++
-			continue
-		}
-
-		if err := event.Validate(); err != nil {
-			slog.Warn("invalid event", "error", err, "event_id", event.ID)
-			if err := consumer.CommitMessage(ctx, msg); err != nil {
-				slog.Error("commit invalid message", "error", err)
-			}
-			errors++
-			continue
-		}
-
-		// Insert with idempotency — ON CONFLICT DO NOTHING handles redeliveries.
-		if err := store.InsertEvent(ctx, event); err != nil {
-			slog.Error("insert event", "error", err, "event_id", event.ID)
-			// Don't commit — the message will be redelivered on next fetch.
-			// This is the at-least-once guarantee in action.
-			errors++
-			time.Sleep(500 * time.Millisecond)
-			continue
-		}
-
-		// Only commit after successful database insert.
-		if err := consumer.CommitMessage(ctx, msg); err != nil {
-			slog.Error("commit message", "error", err, "event_id", event.ID)
-			// The event was inserted but the offset wasn't committed.
-			// On restart this message will be redelivered, but the idempotent
-			// insert will prevent a duplicate row.
-		}
-
-		processed++
-		if processed%1000 == 0 {
-			slog.Info("progress", "processed", processed, "errors", errors)
-		}
+	w := processor.NewWorker(consumer, store, redisCache, *workers)
+	if err := w.Run(ctx); err != nil {
+		slog.Error("worker error", "error", err)
+		os.Exit(1)
 	}
-
-	slog.Info("worker stopped", "total_processed", processed, "total_errors", errors)
 }
 
 func init() {

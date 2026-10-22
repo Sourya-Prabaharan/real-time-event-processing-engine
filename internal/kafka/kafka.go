@@ -11,6 +11,11 @@ import (
 
 const Topic = "events"
 
+// Message is a type alias for kafka.Message, allowing other packages
+// in this project to reference Kafka messages without importing the
+// kafka-go library directly. This keeps the kafka dependency contained.
+type Message = kafka.Message
+
 // EnsureTopic creates the Kafka topic if it doesn't exist. We disable
 // auto-create on the broker and manage topics explicitly so the partition
 // count is intentional, not accidental.
