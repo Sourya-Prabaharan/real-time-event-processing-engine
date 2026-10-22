@@ -47,13 +47,11 @@ func main() {
 		slog.Error("run migrations", "error", err)
 		os.Exit(1)
 	}
-	slog.Info("database ready")
+	slog.Info("database and migrations ready")
 
-	// Connect to Redis.
+	// Connect to Redis (optional - graceful degradation).
 	redisCache, err := cache.NewRedisCache(*redisAddr)
 	if err != nil {
-		// Redis is optional — the system works without it, just without
-		// real-time counters. Log and continue.
 		slog.Warn("redis unavailable, running without cache", "error", err)
 		redisCache = nil
 	} else {
@@ -62,10 +60,16 @@ func main() {
 	}
 
 	store := storage.NewEventStore(db)
+	dlqStore := storage.NewDLQStore(db)
+
+	// Kafka Producer for DLQ forwarding
+	dlqProducer := streamkafka.NewProducer([]string{*broker})
+	defer dlqProducer.Close()
+
 	consumer := streamkafka.NewConsumer([]string{*broker}, *group)
 	defer consumer.Close()
 
-	w := processor.NewWorker(consumer, store, redisCache, *workers)
+	w := processor.NewWorker(consumer, store, dlqStore, dlqProducer, redisCache, *workers)
 	if err := w.Run(ctx); err != nil {
 		slog.Error("worker error", "error", err)
 		os.Exit(1)

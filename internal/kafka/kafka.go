@@ -9,7 +9,10 @@ import (
 	"github.com/segmentio/kafka-go"
 )
 
-const Topic = "events"
+const (
+	Topic    = "events"
+	DLQTopic = "events-dlq"
+)
 
 // Message is a type alias for kafka.Message, allowing other packages
 // in this project to reference Kafka messages without importing the
@@ -32,13 +35,18 @@ func EnsureTopic(ctx context.Context, brokers []string, partitions int) error {
 			NumPartitions:     partitions,
 			ReplicationFactor: 1,
 		},
+		{
+			Topic:             DLQTopic,
+			NumPartitions:     partitions,
+			ReplicationFactor: 1,
+		},
 	}
 	err = conn.CreateTopics(topicConfigs...)
 	if err != nil {
 		// kafka-go returns an error even if the topic already exists;
 		// there's no clean way to distinguish "already exists" from real errors
 		// in all cases, so we log and continue.
-		slog.Warn("create topic (may already exist)", "error", err)
+		slog.Warn("create topics (may already exist)", "error", err)
 	}
 	return nil
 }
@@ -55,9 +63,9 @@ func NewProducer(brokers []string) *Producer {
 		Topic:        Topic,
 		Balancer:     &kafka.Hash{}, // partition by key
 		RequiredAcks: kafka.RequireOne,
-		// In Phase 1 we write synchronously. Phase 2 adds batching.
+		// BatchTimeout and BatchSize allow configurable batching
 		BatchTimeout: 10 * time.Millisecond,
-		BatchSize:    1,
+		BatchSize:    100,
 	}
 	return &Producer{writer: w}
 }
@@ -68,8 +76,21 @@ func NewProducer(brokers []string) *Producer {
 // and purchase sequences.
 func (p *Producer) Publish(ctx context.Context, key string, value []byte) error {
 	return p.writer.WriteMessages(ctx, kafka.Message{
+		Topic: Topic,
 		Key:   []byte(key),
 		Value: value,
+	})
+}
+
+// PublishDLQ forwards an unprocessable or poison-pill message to the dead-letter topic.
+func (p *Producer) PublishDLQ(ctx context.Context, key string, value []byte, reason string) error {
+	return p.writer.WriteMessages(ctx, kafka.Message{
+		Topic: DLQTopic,
+		Key:   []byte(key),
+		Value: value,
+		Headers: []kafka.Header{
+			{Key: "dlq_reason", Value: []byte(reason)},
+		},
 	})
 }
 

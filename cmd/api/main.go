@@ -51,6 +51,7 @@ func main() {
 	}
 
 	store := storage.NewEventStore(db)
+	dlqStore := storage.NewDLQStore(db)
 
 	mux := http.NewServeMux()
 
@@ -102,6 +103,34 @@ func main() {
 			return
 		}
 		writeJSON(w, map[string]int64{"total_events": count})
+	})
+
+	// DLQ: Recent dead-letter events.
+	mux.HandleFunc("GET /api/dlq", func(w http.ResponseWriter, r *http.Request) {
+		limit := 20
+		if l := r.URL.Query().Get("limit"); l != "" {
+			if n, err := strconv.Atoi(l); err == nil && n > 0 && n <= 100 {
+				limit = n
+			}
+		}
+		entries, err := dlqStore.GetRecentDeadLetters(r.Context(), limit)
+		if err != nil {
+			slog.Error("get dead letters", "error", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, entries)
+	})
+
+	// DLQ: Total dead-letter count.
+	mux.HandleFunc("GET /api/dlq/count", func(w http.ResponseWriter, r *http.Request) {
+		count, err := dlqStore.CountDeadLetters(r.Context())
+		if err != nil {
+			slog.Error("count dead letters", "error", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, map[string]int64{"total_dead_letters": count})
 	})
 
 	// Top products — reads from Redis for speed, falls back to PostgreSQL.

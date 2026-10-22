@@ -2,81 +2,121 @@ package processor
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/sourya/streamflow/internal/cache"
 	"github.com/sourya/streamflow/internal/events"
 	streamkafka "github.com/sourya/streamflow/internal/kafka"
-	"github.com/sourya/streamflow/internal/storage"
+	"github.com/sourya/streamflow/internal/retry"
 )
 
-// Worker consumes events from Kafka and processes them through the pipeline:
-// validate → insert to PostgreSQL → update Redis counters → commit offset.
-//
-// It uses a bounded worker pool to process events concurrently while
-// maintaining per-partition ordering through partition-aware dispatching.
+// MessageConsumer defines the reader interface required by the worker.
+// Idiomatic Go: consumer accepted as interface to enable unit testing and crash simulations.
+type MessageConsumer interface {
+	FetchMessage(ctx context.Context) (streamkafka.Message, error)
+	CommitMessage(ctx context.Context, msg streamkafka.Message) error
+	Close() error
+}
+
+// EventPersister defines the database persistence contract.
+type EventPersister interface {
+	InsertEvent(ctx context.Context, e *events.Event) error
+}
+
+// DeadLetterRecorder persists unprocessable messages for auditing and re-drive.
+type DeadLetterRecorder interface {
+	RecordDeadLetter(ctx context.Context, topic string, partition int, offset int64, payload []byte, reason string) error
+}
+
+// DeadLetterPublisher publishes failed messages to a Kafka DLQ topic.
+type DeadLetterPublisher interface {
+	PublishDLQ(ctx context.Context, key string, value []byte, reason string) error
+}
+
+// EventCache updates real-time analytics counters.
+type EventCache interface {
+	RecordEvent(ctx context.Context, e *events.Event) error
+}
+
+// Worker coordinates Kafka consumption, idempotent database persistence,
+// exponential backoff retries, dead-letter routing, and offset commits.
 type Worker struct {
-	consumer *streamkafka.Consumer
-	store    *storage.EventStore
-	cache    *cache.RedisCache
-	poolSize int
+	consumer     MessageConsumer
+	store        EventPersister
+	dlqStore     DeadLetterRecorder
+	dlqPublisher DeadLetterPublisher
+	cache        EventCache
+	poolSize     int
+	retryCfg     retry.Config
 
 	processed atomic.Int64
 	errors    atomic.Int64
-	// Track processing latency for p50/p95/p99 reporting.
+	dlqCount  atomic.Int64
 	latencies *LatencyTracker
 }
 
-func NewWorker(consumer *streamkafka.Consumer, store *storage.EventStore, cache *cache.RedisCache, poolSize int) *Worker {
+func NewWorker(
+	consumer MessageConsumer,
+	store EventPersister,
+	dlqStore DeadLetterRecorder,
+	dlqPublisher DeadLetterPublisher,
+	cache EventCache,
+	poolSize int,
+) *Worker {
 	if poolSize < 1 {
 		poolSize = 1
 	}
 	return &Worker{
-		consumer:  consumer,
-		store:     store,
-		cache:     cache,
-		poolSize:  poolSize,
-		latencies: NewLatencyTracker(10000),
+		consumer:     consumer,
+		store:        store,
+		dlqStore:     dlqStore,
+		dlqPublisher: dlqPublisher,
+		cache:        cache,
+		poolSize:     poolSize,
+		retryCfg:     retry.DefaultConfig(),
+		latencies:    NewLatencyTracker(10000),
 	}
+}
+
+func (w *Worker) SetRetryConfig(cfg retry.Config) {
+	w.retryCfg = cfg
 }
 
 func (w *Worker) Processed() int64 { return w.processed.Load() }
 func (w *Worker) Errors() int64    { return w.errors.Load() }
+func (w *Worker) DLQCount() int64  { return w.dlqCount.Load() }
 
-// Run starts the worker pool and blocks until ctx is cancelled.
-// Each worker goroutine pulls from a shared channel. The main loop
-// fetches messages from Kafka and dispatches them to the pool.
+// Run starts partition-pinned worker goroutines and the main fetch loop.
 //
-// Why a channel-based pool instead of spawning a goroutine per message:
-// A bounded channel prevents goroutine count from growing under load.
-// If all workers are busy, the fetch loop blocks on the channel send,
-// which creates natural backpressure — Kafka consumer lag grows, but
-// the worker doesn't OOM from unbounded goroutine creation.
+// Concurrency & Ordering Guarantee:
+// Instead of random worker assignment, messages are dispatched by partition ID
+// (partition % poolSize). This guarantees that:
+//  1. All events from a given Kafka partition are processed sequentially.
+//  2. Offsets for each partition are committed monotonically, preventing
+//     the classic race condition where offset N+1 commits before offset N finishes.
+//  3. Goroutine count is strictly bounded by poolSize.
 func (w *Worker) Run(ctx context.Context) error {
-	type work struct {
-		event *events.Event
-		msg   streamkafka.Message
+	queues := make([]chan streamkafka.Message, w.poolSize)
+	for i := range queues {
+		queues[i] = make(chan streamkafka.Message, 100)
 	}
 
-	ch := make(chan work, w.poolSize)
 	var wg sync.WaitGroup
-
-	// Start worker goroutines.
 	for i := 0; i < w.poolSize; i++ {
 		wg.Add(1)
-		go func(id int) {
+		go func(workerID int, ch <-chan streamkafka.Message) {
 			defer wg.Done()
-			for item := range ch {
-				w.processEvent(ctx, item.event, item.msg)
+			for msg := range ch {
+				w.handleMessage(ctx, msg)
 			}
-		}(i)
+		}(i, queues[i])
 	}
 
-	// Fetch loop: read from Kafka, dispatch to workers.
-	slog.Info("worker started", "pool_size", w.poolSize)
+	slog.Info("worker pool started", "pool_size", w.poolSize)
+
 	for {
 		msg, err := w.consumer.FetchMessage(ctx)
 		if err != nil {
@@ -85,75 +125,78 @@ func (w *Worker) Run(ctx context.Context) error {
 			}
 			slog.Error("fetch message", "error", err)
 			w.errors.Add(1)
-			time.Sleep(time.Second)
+			time.Sleep(200 * time.Millisecond)
 			continue
 		}
 
-		event, err := events.Unmarshal(msg.Value)
-		if err != nil {
-			slog.Error("unmarshal event", "error", err,
-				"offset", msg.Offset, "partition", msg.Partition)
-			// Bad message — commit and skip. Phase 3 will route to dead-letter.
-			if commitErr := w.consumer.CommitMessage(ctx, msg); commitErr != nil {
-				slog.Error("commit bad message", "error", commitErr)
-			}
-			w.errors.Add(1)
-			continue
+		// Partition pinning: route by partition to guarantee per-partition sequence
+		targetWorker := int(msg.Partition) % w.poolSize
+		if targetWorker < 0 {
+			targetWorker = -targetWorker
 		}
 
-		if err := event.Validate(); err != nil {
-			slog.Warn("invalid event", "error", err, "event_id", event.ID)
-			if commitErr := w.consumer.CommitMessage(ctx, msg); commitErr != nil {
-				slog.Error("commit invalid message", "error", commitErr)
-			}
-			w.errors.Add(1)
-			continue
-		}
-
-		// Dispatch to worker pool. This blocks if all workers are busy,
-		// which is the backpressure mechanism.
 		select {
-		case ch <- work{event: event, msg: msg}:
+		case queues[targetWorker] <- msg:
 		case <-ctx.Done():
 			break
 		}
 	}
 
-	// Shutdown: close the channel so workers drain remaining items, then wait.
-	close(ch)
+	// Graceful shutdown: close input queues and wait for in-flight messages to drain
+	for _, ch := range queues {
+		close(ch)
+	}
 	wg.Wait()
-	slog.Info("worker stopped",
+
+	slog.Info("worker pool drained and stopped",
 		"total_processed", w.processed.Load(),
 		"total_errors", w.errors.Load(),
+		"total_dlq", w.dlqCount.Load(),
 	)
 	return nil
 }
 
-func (w *Worker) processEvent(ctx context.Context, event *events.Event, msg streamkafka.Message) {
+func (w *Worker) handleMessage(ctx context.Context, msg streamkafka.Message) {
 	start := time.Now()
 
-	// Step 1: Persist to PostgreSQL (idempotent via ON CONFLICT DO NOTHING).
-	if err := w.store.InsertEvent(ctx, event); err != nil {
-		slog.Error("insert event", "error", err, "event_id", event.ID)
-		w.errors.Add(1)
-		// Don't commit — message will be redelivered.
+	// 1. Deserialization
+	event, err := events.Unmarshal(msg.Value)
+	if err != nil {
+		w.routeToDLQ(ctx, msg, fmt.Sprintf("unmarshal error: %v", err))
 		return
 	}
 
-	// Step 2: Update Redis counters. If Redis is down, we still committed to
-	// PostgreSQL (the source of truth). Redis can be rebuilt from PG later.
+	// 2. Schema Validation
+	if err := event.Validate(); err != nil {
+		w.routeToDLQ(ctx, msg, fmt.Sprintf("validation error: %v", err))
+		return
+	}
+
+	// 3. Idempotent Database Insert with Exponential Backoff Retry
+	insertOp := func(opCtx context.Context) error {
+		return w.store.InsertEvent(opCtx, event)
+	}
+
+	if err := retry.Do(ctx, w.retryCfg, insertOp); err != nil {
+		slog.Error("database insert exhausted retries", "error", err, "event_id", event.ID)
+		w.routeToDLQ(ctx, msg, fmt.Sprintf("database write exhausted retries: %v", err))
+		return
+	}
+
+	// 4. Redis Cache Update (Non-blocking / Best-effort)
+	// The database is the authoritative source of truth. Redis failure does not
+	// block message commit or pipeline forward progress.
 	if w.cache != nil {
 		if err := w.cache.RecordEvent(ctx, event); err != nil {
 			slog.Warn("redis update failed (non-fatal)", "error", err, "event_id", event.ID)
-			// Don't return — PG insert succeeded, we should still commit the offset.
 		}
 	}
 
-	// Step 3: Commit Kafka offset only after successful persistence.
+	// 5. Commit Offset (At-least-once guarantee)
 	if err := w.consumer.CommitMessage(ctx, msg); err != nil {
-		slog.Error("commit message", "error", err, "event_id", event.ID)
-		// PG insert succeeded but offset not committed. On restart, the message
-		// will be redelivered and the idempotent insert will prevent a duplicate.
+		slog.Error("commit offset failed", "error", err, "event_id", event.ID)
+		w.errors.Add(1)
+		return
 	}
 
 	elapsed := time.Since(start)
@@ -162,9 +205,10 @@ func (w *Worker) processEvent(ctx context.Context, event *events.Event, msg stre
 
 	if w.processed.Load()%5000 == 0 {
 		p50, p95, p99 := w.latencies.Percentiles()
-		slog.Info("progress",
+		slog.Info("processing milestone",
 			"processed", w.processed.Load(),
 			"errors", w.errors.Load(),
+			"dlq", w.dlqCount.Load(),
 			"p50_ms", p50.Milliseconds(),
 			"p95_ms", p95.Milliseconds(),
 			"p99_ms", p99.Milliseconds(),
@@ -172,7 +216,38 @@ func (w *Worker) processEvent(ctx context.Context, event *events.Event, msg stre
 	}
 }
 
-// GetLatencies returns the current latency percentiles.
+// routeToDLQ handles permanently failed messages by logging to DLQ storage/Kafka
+// and committing the message offset so the partition is not blocked indefinitely.
+func (w *Worker) routeToDLQ(ctx context.Context, msg streamkafka.Message, reason string) {
+	w.errors.Add(1)
+	w.dlqCount.Add(1)
+	slog.Warn("routing message to dead-letter queue",
+		"topic", msg.Topic,
+		"partition", msg.Partition,
+		"offset", msg.Offset,
+		"reason", reason,
+	)
+
+	// Persist to DLQ table in PostgreSQL
+	if w.dlqStore != nil {
+		if err := w.dlqStore.RecordDeadLetter(ctx, msg.Topic, int(msg.Partition), msg.Offset, msg.Value, reason); err != nil {
+			slog.Error("failed to record dead letter in database", "error", err)
+		}
+	}
+
+	// Publish to Kafka events-dlq topic if publisher available
+	if w.dlqPublisher != nil {
+		if err := w.dlqPublisher.PublishDLQ(ctx, string(msg.Key), msg.Value, reason); err != nil {
+			slog.Error("failed to publish to kafka dlq topic", "error", err)
+		}
+	}
+
+	// Commit offset to avoid poison-pill retry loop
+	if err := w.consumer.CommitMessage(ctx, msg); err != nil {
+		slog.Error("failed to commit offset after dlq routing", "error", err)
+	}
+}
+
 func (w *Worker) GetLatencies() (p50, p95, p99 time.Duration) {
 	return w.latencies.Percentiles()
 }
