@@ -16,36 +16,45 @@ Building StreamFlow gave me practical experience implementing distributed system
 - Partition-keyed ordering in Kafka
 - Bounded concurrency with channel-based backpressure in Go
 - At-least-once delivery semantics paired with idempotent database writes
-- Dead-letter queues (DLQ) for non-retryable poison pill events
+- Redis counter protection against double-counting on redelivered events
+- Dead-letter queues (DLQ) with zero-drop safety guarantees for poison pill events
 - Separating durable transactional storage (PostgreSQL) from rebuildable real-time caching (Redis)
 
 ---
 
 ## Architecture Overview
 
+![StreamFlow Architecture](docs/images/architecture.svg)
+
 ```mermaid
 flowchart LR
-    P[Event Producer<br/>Weighted RNG] -->|Key: product_id| K[Apache Kafka Broker<br/>6 Partitions]
-    K -->|FetchMessage| D[Partition-Pinned Dispatcher]
-    D -->|msg.Partition % poolSize| W[Bounded Worker Pool<br/>N Goroutines]
-    W -->|ON CONFLICT (id) DO NOTHING| PG[(PostgreSQL 16<br/>Events & DLQ Tables)]
-    W -->|Pipelined Counters| RD[(Redis 7<br/>Throughput & Revenue)]
-    W -->|Poison Pills / Retry Exhausted| DLQ[Dead-Letter Queue<br/>PostgreSQL + events-dlq]
-    W -->|CommitMessage| K
-    API[Go HTTP Server & Console<br/>:8080] --> PG
+    P["Event Producer<br/>(Weighted RNG)"] -->|"Key: product_id"| K["Apache Kafka Broker<br/>(6 Partitions)"]
+    K -->|"FetchMessage"| D["Partition Dispatcher"]
+    D -->|"partition % poolSize"| W["Worker Pool<br/>(Bounded Concurrency)"]
+    W -->|"ON CONFLICT DO NOTHING"| PG[("PostgreSQL 16<br/>Durable Storage")]
+    W -->|"Pipelined Counters"| RD[("Redis 7<br/>Real-Time Cache")]
+    W -->|"Poison Pills"| DLQ["Dead-Letter Queue<br/>(PostgreSQL + events-dlq)"]
+    W -->|"CommitMessage"| K
+    API["Go HTTP Server<br/>(:8080)"] --> PG
     API --> RD
-    PROM[Prometheus :9090] -->|Scrape /metrics| API
-    GRAF[Grafana :3000] --> PROM
+    PROM["Prometheus<br/>(:9090)"] -->|"Scrape /metrics"| API
+    GRAF["Grafana<br/>(:3000)"] --> PROM
 ```
 
 ### End-to-End Event Lifecycle:
 1. **Producer:** Simulates e-commerce activity (product views, cart additions, purchases, inventory updates) using a seeded random generator with realistic distributions (e.g. many views, fewer checkouts).
 2. **Kafka Ingestion:** Publishes events to topic `events` with `Key = product_id`. This guarantees that all state mutations for a specific item land on the exact same partition in chronological order.
 3. **Go Worker Pool:** Consumes messages using manual offset commits. Goroutines are pinned to partitions (`partition % poolSize`) to preserve in-order processing and monotonic offset commits per partition.
-4. **Idempotent Persistence:** Writes events to PostgreSQL using `ON CONFLICT (id) DO NOTHING`. If a worker crashes before committing an offset, Kafka redelivers the event, but the primary key constraint prevents duplicate records.
-5. **Real-Time Analytics:** Updates per-minute throughput, revenue (in integer cents), and top-product sorted sets in Redis using pipelined commands.
-6. **Dead-Letter Handling:** Malformed payloads, schema validation failures, or database writes that fail all 3 exponential backoff retries are written to `dead_letter_events` in PostgreSQL and forwarded to the `events-dlq` Kafka topic. The message offset is then committed to unblock the partition.
+4. **Idempotent Persistence:** Writes events to PostgreSQL using `ON CONFLICT (id) DO NOTHING`. Returns `inserted bool` to determine whether a row was newly written or previously existed.
+5. **Real-Time Analytics:** Updates per-minute throughput, revenue (in integer cents), and top-product sorted sets in Redis using pipelined commands **only when `inserted == true`**, strictly preventing double-counting during redeliveries.
+6. **Dead-Letter Handling:** Malformed payloads, schema validation failures, or database writes that fail all 3 exponential backoff retries are written to `dead_letter_events` in PostgreSQL and forwarded to the `events-dlq` Kafka topic. If DLQ persistence fails across all targets, the offset is **not** committed to prevent permanent event loss.
 7. **Observability:** Metrics are exposed at `/metrics` for Prometheus scraping and visualized via a pre-provisioned Grafana dashboard. An internal console is served directly at `http://localhost:8080/`.
+
+---
+
+## Operational Console Preview
+
+![StreamFlow Operational Console](docs/images/console-preview.svg)
 
 ---
 
@@ -59,6 +68,7 @@ flowchart LR
 | **Real-Time Cache** | Redis 7 | Sub-millisecond atomic counters (`INCR`, `ZINCRBY`) with automatic TTL key expiration for fast dashboard reads. |
 | **Metrics & Dashboards** | Prometheus & Grafana | Pull-based metric collection, histogram percentiles (p50, p95, p99), and operational dashboarding. |
 | **Infrastructure** | Docker & Docker Compose | Reproducible local deployment of Kafka, Zookeeper, PostgreSQL, Redis, Prometheus, and Grafana. |
+| **CI / CD** | GitHub Actions | Automated linting, vet, race detection (`-race`), microbenchmarks, and multi-binary builds. |
 
 ---
 
@@ -99,7 +109,7 @@ This compiles four binaries into `bin/`:
 - `bin/producer` — Traffic generator
 - `bin/worker` — Kafka consumer and persistence pipeline
 - `bin/api` — HTTP API and real-time dashboard
-- `bin/benchmark` — Multi-tier benchmark utility
+- `bin/benchmark` — Benchmark utility supporting in-memory and e2e distributed modes
 
 ### 3. Start the Pipeline
 Open three terminal tabs:
@@ -144,19 +154,19 @@ make produce RATE=500
 
 ## Performance & Benchmarks
 
-StreamFlow includes a load-testing engine (`cmd/benchmark`) that measures completed pipeline execution rather than just event generation.
+StreamFlow provides two distinct benchmark modes via `cmd/benchmark` to differentiate Go runtime throughput from live distributed database limits:
 
-### Benchmark Setup:
-- **Machine:** Apple M3 (8 Cores, 8 GOMAXPROCS)
-- **OS:** macOS (darwin/arm64)
+### 1. In-Memory Pipeline Baseline Benchmark
+Tests Go runtime channel dispatch, JSON serialization/deserialization, UUID validation, and channel backpressure without external network or disk fsync latency:
+```bash
+make benchmark
+```
+- **Hardware:** Apple M3 (8 Cores, 8 GOMAXPROCS)
 - **Worker Concurrency:** 16 goroutines with channel backpressure
-- **Storage:** Parameterized SQL with connection pooling simulation
-
-### Results:
 
 ```text
 ================================================================================
- BENCHMARK PERFORMANCE RESULTS
+ IN-MEMORY BASELINE RESULTS (Go Concurrency & Channel Backpressure)
 ================================================================================
 Target/sec   | Actual/sec   | p50 (ms)   | p95 (ms)   | p99 (ms)   | Errors/Drops | Bottleneck              
 --------------------------------------------------------------------------------
@@ -165,6 +175,14 @@ Target/sec   | Actual/sec   | p50 (ms)   | p95 (ms)   | p99 (ms)   | Errors/Drop
 10000        | 9804.3       | 0.00       | 0.00       | 0.00       | 0            | None (Sustained)        
 ================================================================================
 ```
+
+### 2. End-to-End Distributed Benchmark (Kafka → Worker → PostgreSQL)
+Measures live ingestion where events are published to Kafka, consumed by the worker pool, and confirmed via PostgreSQL database row count assertions (`SELECT COUNT(*)`):
+```bash
+make benchmark-e2e RATE=1000
+```
+- **Primary Bottleneck in E2E:** Unlike the in-memory baseline, end-to-end distributed throughput is constrained by PostgreSQL write-ahead log (WAL) `fsync` disk flushes per transaction and database connection pool contention.
+- **Scaling E2E Throughput:** To scale beyond 2,500 events/sec against disk-backed PostgreSQL, the pipeline uses database connection pooling (`pgx` max 25 connections) and multi-partition consumer groups.
 
 ### Microbenchmarks (Go `testing.B`):
 
@@ -184,24 +202,25 @@ BenchmarkWorker_ProcessEventDirect-8   100,000,000 ops      10.44 ns/op     0 B/
 
 ## Reliability & Failure Recovery
 
-### 1. Idempotency Under Redelivery
+### 1. Idempotency & Redis Double-Count Prevention
 In distributed systems, networks fail and timeouts occur. When a consumer crashes after writing to the database but before acknowledging Kafka, Kafka redelivers the message upon restart.
 - StreamFlow uses deterministic UUIDs on each event.
-- PostgreSQL inserts use `ON CONFLICT (id) DO NOTHING`.
-- Duplicate deliveries are accepted without error and without creating duplicate database state.
+- PostgreSQL inserts execute `ON CONFLICT (id) DO NOTHING` and return `(inserted bool, err error)` based on `RowsAffected()`.
+- **Redis Double-Count Protection:** Redis counters (revenue, throughput, top products) are **only updated if `inserted == true`**. If an event is redelivered, PostgreSQL safely ignores it and Redis avoids incrementing counters twice.
 
-### 2. Transient Retries with Jittered Backoff
-If PostgreSQL temporarily runs out of connections or encounters a lock timeout, the worker does not crash. It retries up to 3 times using exponential backoff with randomized jitter (80%–120%) to prevent thundering herd spikes.
+### 2. Dead-Letter Queue (DLQ) with Zero-Drop Guarantee
+When a message cannot be parsed (malformed JSON) or fails validation (negative prices, missing user IDs), it is routed to the `dead_letter_events` table and published to the `events-dlq` Kafka topic.
+- **Safety Invariant:** If DLQ persistence fails across all targets (e.g. database down and Kafka unreachable), the worker **refuses to commit the Kafka offset**. The message is retained in Kafka until storage recovers, preventing permanent data loss.
 
-### 3. Dead-Letter Queue (DLQ)
-When a message cannot be parsed (malformed JSON) or fails validation (negative prices, missing user IDs), it is routed to the `dead_letter_events` table and published to the `events-dlq` Kafka topic. The consumer commits the offset so a single bad message does not halt processing for the entire partition.
+### 3. Transient Retries with Jittered Backoff
+If PostgreSQL temporarily runs out of connections or encounters lock contention, the worker does not crash. It retries up to 3 times using exponential backoff with randomized jitter (80%–120%) to prevent thundering herd spikes.
 
 ### 4. Verified Automated Tests
-Run the full reliability and unit test suite:
+Run the full test suite with race detector:
 ```bash
-make test
+make test-race
 ```
-The test suite includes 26 automated tests verifying:
+The test suite includes 28 automated tests verifying:
 - Schema validation edge cases (missing IDs, bad UUIDs, negative prices)
 - JSON marshaling and unmarshaling round-trips
 - Deterministic random generator seeding
@@ -211,7 +230,10 @@ The test suite includes 26 automated tests verifying:
 - Transient database error retry leading to successful persistence
 - Permanent database error diversion to DLQ after exhausting retries
 - Duplicate delivery prevention (idempotent storage effect)
+- Redis double-count prevention on duplicate event redeliveries
+- DLQ failure preventing premature offset commit (zero data loss)
 - Worker crash and recovery simulation (zero lost messages, zero duplicate records)
+- Live container integration test (`tests/integration_test.go`)
 
 ---
 
@@ -255,3 +277,5 @@ The test suite includes 26 automated tests verifying:
   The uncommitted Kafka offset remains at the last successfully committed message. When the worker restarts (or another consumer group member rebalances), Kafka re-delivers the message. The database insert uses `ON CONFLICT (id) DO NOTHING`, ensuring idempotent side effects.
 - **Why use Redis if PostgreSQL already stores everything?**  
   PostgreSQL is the durable source of truth. Querying `COUNT(*)` or summing revenue over millions of rows on every dashboard refresh introduces query latency. Redis maintains pre-aggregated counters (`INCR`, `ZINCRBY`) in memory, serving dashboard reads in sub-millisecond time. If Redis crashes, it can be rebuilt from PostgreSQL.
+- **How do you prevent Redis double-counting when Kafka redelivers an event?**  
+  `InsertEvent` checks `RowsAffected()`. If rows affected is 0, the event was already stored by a prior worker run. Redis counters are only updated when `inserted == true`, ensuring metrics remain accurate even during crash recoveries.

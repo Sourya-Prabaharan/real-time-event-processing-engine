@@ -72,23 +72,24 @@ func NewMockStore() *MockStore {
 	return &MockStore{records: make(map[string]*events.Event)}
 }
 
-func (s *MockStore) InsertEvent(ctx context.Context, e *events.Event) error {
+func (s *MockStore) InsertEvent(ctx context.Context, e *events.Event) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	s.callCount++
 	if s.failAlways {
-		return errors.New("database connection refused")
+		return false, errors.New("database connection refused")
 	}
 	if s.failUntil > 0 && s.callCount <= s.failUntil {
-		return errors.New("transient lock error")
+		return false, errors.New("transient lock error")
 	}
 
 	// Idempotent behavior: ON CONFLICT DO NOTHING
 	if _, exists := s.records[e.ID]; !exists {
 		s.records[e.ID] = e
+		return true, nil
 	}
-	return nil
+	return false, nil
 }
 
 func (s *MockStore) RecordCount() int {
@@ -97,20 +98,48 @@ func (s *MockStore) RecordCount() int {
 	return len(s.records)
 }
 
+// MockCache tracks cache record invocations to verify double-count prevention
+type MockCache struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (c *MockCache) RecordEvent(ctx context.Context, e *events.Event) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls++
+	return nil
+}
+
+func (c *MockCache) Calls() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.calls
+}
+
 // MockDLQ implements DeadLetterRecorder and DeadLetterPublisher
 type MockDLQ struct {
-	mu      sync.Mutex
-	entries []string
+	mu         sync.Mutex
+	entries    []string
+	failAlways bool
 }
 
 func (d *MockDLQ) RecordDeadLetter(ctx context.Context, topic string, partition int, offset int64, payload []byte, reason string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if d.failAlways {
+		return errors.New("dlq database write failed")
+	}
 	d.entries = append(d.entries, reason)
 	return nil
 }
 
 func (d *MockDLQ) PublishDLQ(ctx context.Context, key string, value []byte, reason string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.failAlways {
+		return errors.New("dlq kafka publish failed")
+	}
 	return nil
 }
 
@@ -401,5 +430,86 @@ func TestWorker_CrashAndRecoverySimulation(t *testing.T) {
 	}
 	if mockDLQ.Count() != 0 {
 		t.Fatalf("expected 0 DLQ entries during recovery, got %d", mockDLQ.Count())
+	}
+}
+
+// Test 8: Verifies that duplicate/redelivered events do NOT double-count in Redis
+func TestWorker_IdempotencyPreventsRedisDoubleCount(t *testing.T) {
+	sharedID := uuid.New().String()
+	evt := events.Event{
+		ID:        sharedID,
+		Type:      events.Purchase,
+		UserID:    "user-redis-test",
+		ProductID: "prod-redis-test",
+		Price:     150.00,
+		Quantity:  1,
+		Timestamp: time.Now(),
+	}
+
+	// Two messages with the exact same event ID (Kafka at-least-once redelivery)
+	msgs := []streamkafka.Message{
+		makeEventMessage(evt, 0, 501),
+		makeEventMessage(evt, 0, 502),
+	}
+
+	mockConsumer := NewMockConsumer(msgs)
+	mockStore := NewMockStore()
+	mockDLQ := &MockDLQ{}
+	mockCache := &MockCache{}
+
+	w := NewWorker(mockConsumer, mockStore, mockDLQ, nil, mockCache, 1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	_ = w.Run(ctx)
+
+	// Both messages were processed through the pipeline
+	if w.Processed() != 2 {
+		t.Fatalf("expected 2 processed events, got %d", w.Processed())
+	}
+	// PostgreSQL only stores 1 unique record
+	if mockStore.RecordCount() != 1 {
+		t.Fatalf("expected 1 record in store, got %d", mockStore.RecordCount())
+	}
+	// CRITICAL TEST: Redis RecordEvent was called EXACTLY ONCE, preventing double-counting!
+	if mockCache.Calls() != 1 {
+		t.Fatalf("Redis double-counted: expected RecordEvent called exactly 1 time, got %d", mockCache.Calls())
+	}
+	// Both offsets committed
+	if mockConsumer.CommittedCount() != 2 {
+		t.Fatalf("expected both offsets committed, got %d", mockConsumer.CommittedCount())
+	}
+}
+
+// Test 9: Verifies that if DLQ storage fails on all targets, the offset is NOT committed,
+// preventing unrecoverable message loss.
+func TestWorker_DLQFailurePreventsOffsetCommit(t *testing.T) {
+	badMsg := streamkafka.Message{
+		Topic:     "events",
+		Partition: 0,
+		Offset:    999,
+		Key:       []byte("poison-pill"),
+		Value:     []byte(`{malformed json`),
+	}
+
+	mockConsumer := NewMockConsumer([]streamkafka.Message{badMsg})
+	mockStore := NewMockStore()
+	mockDLQ := &MockDLQ{failAlways: true} // Both DB and Kafka DLQ fail
+
+	w := NewWorker(mockConsumer, mockStore, mockDLQ, mockDLQ, nil, 1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	_ = w.Run(ctx)
+
+	// CRITICAL TEST: Offset must NOT be committed if DLQ failed!
+	if mockConsumer.CommittedCount() != 0 {
+		t.Fatalf("Data loss bug: expected 0 committed offsets when DLQ fails, got %d", mockConsumer.CommittedCount())
+	}
+	// DLQ count should remain 0 because it failed to save
+	if w.DLQCount() != 0 {
+		t.Fatalf("expected 0 dlq count on failure, got %d", w.DLQCount())
 	}
 }

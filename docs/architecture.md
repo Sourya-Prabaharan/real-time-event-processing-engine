@@ -8,17 +8,19 @@ This document details the internal design, concurrency patterns, data flow, fail
 
 StreamFlow processes real-time e-commerce activity (product views, cart additions, purchases, inventory updates) across a distributed pipeline:
 
+![StreamFlow Architecture](images/architecture.svg)
+
 ```mermaid
 flowchart LR
-    P[Event Generator / Producer] -->|Key: product_id| K[Apache Kafka<br/>6 Partitions]
-    K -->|Partition-pinned dispatch| W[Go Worker Pool<br/>Bounded Concurrency]
-    W -->|Idempotent ON CONFLICT| DB[(PostgreSQL 16<br/>Durable Source of Truth)]
-    W -->|Pipelined Updates| R[(Redis 7<br/>Real-Time Cache)]
-    W -->|Poison Pills / Exhausted Retries| DLQ[Dead-Letter Queue<br/>DB table + Kafka topic]
-    API[Go HTTP API & Console] --> DB
+    P["Event Producer<br/>(Weighted RNG)"] -->|"Key: product_id"| K["Apache Kafka<br/>(6 Partitions)"]
+    K -->|"Partition-pinned dispatch"| W["Go Worker Pool<br/>(Bounded Concurrency)"]
+    W -->|"Idempotent ON CONFLICT"| DB[("PostgreSQL 16<br/>Durable Source of Truth")]
+    W -->|"Pipelined Updates"| R[("Redis 7<br/>Real-Time Cache")]
+    W -->|"Poison Pills"| DLQ["Dead-Letter Queue<br/>(DB + events-dlq)"]
+    API["Go HTTP API & Console"] --> DB
     API --> R
-    PROM[Prometheus Scraper] -->|/metrics| API
-    G[Grafana] --> PROM
+    PROM["Prometheus Scraper"] -->|"/metrics"| API
+    G["Grafana"] --> PROM
 ```
 
 ---
@@ -61,14 +63,14 @@ StreamFlow guarantees **at-least-once** delivery with idempotent side effects, a
 ```
 Step 1: FetchMessage from Kafka (offset uncommitted)
 Step 2: Deserialize & validate event schema
-Step 3: Execute PostgreSQL insert (ON CONFLICT (id) DO NOTHING) with exponential backoff
-Step 4: Update Redis cache counters (best-effort, non-blocking)
+Step 3: Execute PostgreSQL insert (ON CONFLICT (id) DO NOTHING) with exponential backoff -> returns (inserted bool, err)
+Step 4: Update Redis cache counters ONLY if inserted == true (strictly prevents double-counting on redelivery)
 Step 5: CommitMessage offset to Kafka
 ```
 
 #### Crash Scenario Analysis:
 - **Worker crashes before DB write:** The offset was never committed. Upon restart, Kafka re-delivers the message. The new worker processes it normally.
-- **Worker crashes after DB write, before offset commit:** Upon restart, Kafka re-delivers the message. The worker attempts to insert the event into PostgreSQL, but `ON CONFLICT (id) DO NOTHING` ignores the duplicate UUID primary key. The worker then commits the offset. Zero duplicate rows created.
+- **Worker crashes after DB write, before offset commit:** Upon restart, Kafka re-delivers the message. The worker attempts to insert the event into PostgreSQL, but `ON CONFLICT (id) DO NOTHING` skips the duplicate UUID primary key and returns `inserted = false`. The worker then skips Redis incrementation (preventing double-counting) and commits the offset. Zero duplicate rows created, zero counter inflation.
 - **Redis crashes:** PostgreSQL is the durable source of truth. Redis updates are logged as warnings and do not fail the pipeline. Redis can be fully rebuilt from the authoritative `events` table.
 
 ### Transient Failure Retries with Exponential Backoff
@@ -77,11 +79,11 @@ Downstream database hiccups (e.g., connection pool exhaustion or momentary lock 
 - Initial backoff: 50ms with a 2.0x multiplier
 - Full random jitter (80% to 120%) to avoid thundering herd spikes when the database recovers.
 
-### Dead-Letter Queue (DLQ)
+### Dead-Letter Queue (DLQ) & Zero-Drop Guarantee
 Messages that cannot be processed are never silently dropped or allowed to block the partition indefinitely (poison pills):
 - **Permanent failure triggers:** Malformed JSON, missing required fields, invalid UUIDs, or database errors that exhaust all 3 retry attempts.
 - **DLQ routing:** The message is persisted to the `dead_letter_events` table in PostgreSQL and forwarded to the `events-dlq` Kafka topic with diagnostic headers.
-- **Offset committed:** The message offset is committed to allow the partition to advance to subsequent healthy events.
+- **Zero-Drop Safety Invariant:** If DLQ persistence fails across all targets (e.g., database network partition and Kafka unreachable), the worker **refuses to commit the offset**. The message is retained in Kafka until storage recovers, preventing permanent data loss. Only after successful DLQ persistence is the message offset safely committed.
 
 ---
 

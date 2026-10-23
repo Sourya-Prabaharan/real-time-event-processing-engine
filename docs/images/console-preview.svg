@@ -1,0 +1,145 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 480" width="100%" height="100%">
+  <defs>
+    <style>
+      .bg { fill: #0b0f19; }
+      .topbar { fill: #111827; stroke: #1f2937; stroke-width: 1; }
+      .card { fill: #111827; stroke: #1f2937; stroke-width: 1; rx: 6; }
+      .text-head { fill: #f3f4f6; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 15px; font-weight: 600; }
+      .text-title { fill: #9ca3af; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 11px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.05em; }
+      .text-val { fill: #f3f4f6; font-family: ui-monospace, monospace; font-size: 24px; font-weight: 700; }
+      .text-sub { fill: #6b7280; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 11px; }
+      .text-mono { fill: #94a3b8; font-family: ui-monospace, monospace; font-size: 12px; }
+      .badge-green { fill: #10b981; }
+      .badge-bg { fill: rgba(16, 185, 129, 0.15); stroke: rgba(16, 185, 129, 0.3); stroke-width: 1; rx: 4; }
+      .tag-view { fill: #3b82f6; font-family: ui-monospace, monospace; font-size: 10px; font-weight: 600; }
+      .tag-cart { fill: #f59e0b; font-family: ui-monospace, monospace; font-size: 10px; font-weight: 600; }
+      .tag-buy  { fill: #10b981; font-family: ui-monospace, monospace; font-size: 10px; font-weight: 600; }
+    </style>
+  </defs>
+
+  <rect width="100%" height="100%" class="bg" rx="10"/>
+
+  <!-- Top bar -->
+  <rect x="0" y="0" width="920" height="60" class="topbar"/>
+  <circle cx="30" cy="30" r="5" fill="#ef4444"/>
+  <circle cx="45" cy="30" r="5" fill="#f59e0b"/>
+  <circle cx="60" cy="30" r="5" fill="#10b981"/>
+  <text x="85" y="35" class="text-head">StreamFlow</text>
+  <text x="180" y="34" class="text-sub">Operational Telemetry Console (http://localhost:8080)</text>
+
+  <rect x="760" y="18" width="130" height="24" class="badge-bg"/>
+  <circle cx="775" cy="30" r="4" fill="#10b981"/>
+  <text x="785" y="34" class="badge-green" font-family="ui-monospace, monospace" font-size="11" font-weight="600">SYSTEM HEALTHY</text>
+
+  <!-- Notice Bar -->
+  <rect x="25" y="75" width="870" height="34" fill="#1e293b" rx="4"/>
+  <rect x="25" y="75" width="4" height="34" fill="#3b82f6"/>
+  <text x="40" y="96" fill="#cbd5e1" font-family="-apple-system, sans-serif" font-size="12">
+    Architecture: Apache Kafka (6 partitions, key: product_id) &rarr; Go Worker Pool (bounded concurrency) &rarr; PostgreSQL (idempotent PK) + Redis (pipelined counters)
+  </text>
+
+  <!-- KPI Row -->
+  <!-- Card 1: Throughput -->
+  <g transform="translate(25, 125)">
+    <rect width="200" height="95" class="card"/>
+    <text x="16" y="28" class="text-title">Throughput (Current Min)</text>
+    <text x="16" y="60" class="text-val">5,000 ops</text>
+    <text x="16" y="80" class="text-sub">Measured processing rate</text>
+  </g>
+
+  <!-- Card 2: Total Events -->
+  <g transform="translate(245, 125)">
+    <rect width="200" height="95" class="card"/>
+    <text x="16" y="28" class="text-title">Total Authoritative Events</text>
+    <text x="16" y="60" class="text-val">100,000</text>
+    <text x="16" y="80" class="text-sub">Persisted in PostgreSQL</text>
+  </g>
+
+  <!-- Card 3: Revenue -->
+  <g transform="translate(465, 125)">
+    <rect width="200" height="95" class="card"/>
+    <text x="16" y="28" class="text-title">Revenue (Current Min)</text>
+    <text x="16" y="60" class="text-val">$14,820.50</text>
+    <text x="16" y="80" class="text-sub">Aggregated in Redis (in cents)</text>
+  </g>
+
+  <!-- Card 4: DLQ -->
+  <g transform="translate(685, 125)">
+    <rect width="210" height="95" class="card"/>
+    <text x="16" y="28" class="text-title">Dead-Letter Queue (DLQ)</text>
+    <text x="16" y="60" class="text-val" fill="#10b981">0</text>
+    <text x="16" y="80" class="text-sub">Zero unrecoverable failures</text>
+  </g>
+
+  <!-- Lower Section: Events Table + Top Products -->
+  <!-- Table: Recent Events -->
+  <g transform="translate(25, 235)">
+    <rect width="570" height="225" class="card"/>
+    <text x="20" y="30" class="text-title">Recent Ingested Events (Live Feed)</text>
+
+    <!-- Table header -->
+    <line x1="20" y1="45" x2="550" y2="45" stroke="#1f2937"/>
+    <text x="20" y="62" class="text-sub">TIME</text>
+    <text x="120" y="62" class="text-sub">EVENT TYPE</text>
+    <text x="240" y="62" class="text-sub">PRODUCT ID</text>
+    <text x="360" y="62" class="text-sub">USER ID</text>
+    <text x="480" y="62" class="text-sub">PRICE</text>
+
+    <!-- Row 1 -->
+    <line x1="20" y1="72" x2="550" y2="72" stroke="#1f2937" stroke-dasharray="2"/>
+    <text x="20" y="92" class="text-mono">12:35:01</text>
+    <rect x="115" y="78" width="65" height="18" fill="rgba(16,185,129,0.15)" rx="3"/>
+    <text x="122" y="91" class="tag-buy">purchase</text>
+    <text x="240" y="92" class="text-mono">prod-0042</text>
+    <text x="360" y="92" class="text-mono">user-0821</text>
+    <text x="480" y="92" class="text-mono">$149.99</text>
+
+    <!-- Row 2 -->
+    <line x1="20" y1="105" x2="550" y2="105" stroke="#1f2937" stroke-dasharray="2"/>
+    <text x="20" y="125" class="text-mono">12:35:01</text>
+    <rect x="115" y="111" width="80" height="18" fill="rgba(59,130,246,0.15)" rx="3"/>
+    <text x="122" y="124" class="tag-view">product_view</text>
+    <text x="240" y="125" class="text-mono">prod-0012</text>
+    <text x="360" y="125" class="text-mono">user-0193</text>
+    <text x="480" y="125" class="text-mono">-</text>
+
+    <!-- Row 3 -->
+    <line x1="20" y1="138" x2="550" y2="138" stroke="#1f2937" stroke-dasharray="2"/>
+    <text x="20" y="158" class="text-mono">12:35:02</text>
+    <rect x="115" y="144" width="75" height="18" fill="rgba(245,158,11,0.15)" rx="3"/>
+    <text x="122" y="157" class="tag-cart">add_to_cart</text>
+    <text x="240" y="158" class="text-mono">prod-0089</text>
+    <text x="360" y="158" class="text-mono">user-0442</text>
+    <text x="480" y="158" class="text-mono">$39.50</text>
+
+    <!-- Row 4 -->
+    <line x1="20" y1="171" x2="550" y2="171" stroke="#1f2937" stroke-dasharray="2"/>
+    <text x="20" y="191" class="text-mono">12:35:02</text>
+    <rect x="115" y="177" width="80" height="18" fill="rgba(59,130,246,0.15)" rx="3"/>
+    <text x="122" y="190" class="tag-view">product_view</text>
+    <text x="240" y="191" class="text-mono">prod-0003</text>
+    <text x="360" y="191" class="text-mono">user-0775</text>
+    <text x="480" y="191" class="text-mono">-</text>
+  </g>
+
+  <!-- Side Card: Top Products -->
+  <g transform="translate(615, 235)">
+    <rect width="280" height="225" class="card"/>
+    <text x="20" y="30" class="text-title">Top Viewed Products Today (Redis)</text>
+    <line x1="20" y1="45" x2="260" y2="45" stroke="#1f2937"/>
+    <text x="20" y="62" class="text-sub">PRODUCT</text>
+    <text x="190" y="62" class="text-sub">VIEW COUNT</text>
+
+    <text x="20" y="92" class="text-mono">prod-0012</text>
+    <text x="190" y="92" class="text-mono">4,120</text>
+
+    <text x="20" y="125" class="text-mono">prod-0042</text>
+    <text x="190" y="125" class="text-mono">3,890</text>
+
+    <text x="20" y="158" class="text-mono">prod-0007</text>
+    <text x="190" y="158" class="text-mono">2,740</text>
+
+    <text x="20" y="191" class="text-mono">prod-0089</text>
+    <text x="190" y="191" class="text-mono">2,110</text>
+  </g>
+</svg>

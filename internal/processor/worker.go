@@ -23,8 +23,10 @@ type MessageConsumer interface {
 }
 
 // EventPersister defines the database persistence contract.
+// Returns (inserted = true, nil) if a new event was persisted.
+// Returns (inserted = false, nil) if the event already existed (idempotent conflict skip).
 type EventPersister interface {
-	InsertEvent(ctx context.Context, e *events.Event) error
+	InsertEvent(ctx context.Context, e *events.Event) (bool, error)
 }
 
 // DeadLetterRecorder persists unprocessable messages for auditing and re-drive.
@@ -174,8 +176,11 @@ func (w *Worker) handleMessage(ctx context.Context, msg streamkafka.Message) {
 	}
 
 	// 3. Idempotent Database Insert with Exponential Backoff Retry
+	var inserted bool
 	insertOp := func(opCtx context.Context) error {
-		return w.store.InsertEvent(opCtx, event)
+		var err error
+		inserted, err = w.store.InsertEvent(opCtx, event)
+		return err
 	}
 
 	if err := retry.Do(ctx, w.retryCfg, insertOp); err != nil {
@@ -184,10 +189,11 @@ func (w *Worker) handleMessage(ctx context.Context, msg streamkafka.Message) {
 		return
 	}
 
-	// 4. Redis Cache Update (Non-blocking / Best-effort)
-	// The database is the authoritative source of truth. Redis failure does not
-	// block message commit or pipeline forward progress.
-	if w.cache != nil {
+	// 4. Redis Cache Update (Strict Idempotency):
+	// ONLY update real-time counters if this event was newly inserted into PostgreSQL.
+	// If inserted == false, this message is an at-least-once redelivery of an already-stored event;
+	// updating Redis here would double-count revenue and throughput.
+	if inserted && w.cache != nil {
 		if err := w.cache.RecordEvent(ctx, event); err != nil {
 			slog.Warn("redis update failed (non-fatal)", "error", err, "event_id", event.ID)
 		}
@@ -225,7 +231,6 @@ func (w *Worker) handleMessage(ctx context.Context, msg streamkafka.Message) {
 // and committing the message offset so the partition is not blocked indefinitely.
 func (w *Worker) routeToDLQ(ctx context.Context, msg streamkafka.Message, reason string) {
 	w.errors.Add(1)
-	w.dlqCount.Add(1)
 
 	metrics.EventsProcessedTotal.WithLabelValues("unknown", "failure").Inc()
 	metrics.DeadLetterEventsTotal.WithLabelValues(reason).Inc()
@@ -237,21 +242,41 @@ func (w *Worker) routeToDLQ(ctx context.Context, msg streamkafka.Message, reason
 		"reason", reason,
 	)
 
-	// Persist to DLQ table in PostgreSQL
+	dlqSaved := false
+
+	// Attempt 1: Persist to DLQ table in PostgreSQL
 	if w.dlqStore != nil {
 		if err := w.dlqStore.RecordDeadLetter(ctx, msg.Topic, int(msg.Partition), msg.Offset, msg.Value, reason); err != nil {
 			slog.Error("failed to record dead letter in database", "error", err)
+		} else {
+			dlqSaved = true
 		}
 	}
 
-	// Publish to Kafka events-dlq topic if publisher available
+	// Attempt 2: Publish to Kafka events-dlq topic
 	if w.dlqPublisher != nil {
 		if err := w.dlqPublisher.PublishDLQ(ctx, string(msg.Key), msg.Value, reason); err != nil {
 			slog.Error("failed to publish to kafka dlq topic", "error", err)
+		} else {
+			dlqSaved = true
 		}
 	}
 
-	// Commit offset to avoid poison-pill retry loop
+	// Data Loss Prevention Guarantee:
+	// If DLQ persistence failed on ALL targets, do NOT commit the offset!
+	// Committing an offset without saving the dead letter permanently discards data.
+	if !dlqSaved {
+		slog.Error("CRITICAL: DLQ storage failed on all targets; refusing to commit offset to prevent permanent event loss",
+			"topic", msg.Topic,
+			"partition", msg.Partition,
+			"offset", msg.Offset,
+		)
+		return
+	}
+
+	w.dlqCount.Add(1)
+
+	// Safe to advance offset now that the dead letter is durably stored
 	if err := w.consumer.CommitMessage(ctx, msg); err != nil {
 		slog.Error("failed to commit offset after dlq routing", "error", err)
 	}

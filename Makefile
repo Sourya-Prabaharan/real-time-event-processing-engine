@@ -41,9 +41,13 @@ test-race:
 bench:
 	go test ./... -bench=. -benchmem -run=^$$
 
-# Run multi-tier load-testing benchmark engine (1k, 5k, 10k events/sec)
+# Run multi-tier in-memory pipeline benchmark (1k, 5k, 10k events/sec)
 benchmark: build
-	./bin/benchmark -all-tiers
+	./bin/benchmark -mode=in-memory -all-tiers
+
+# Run end-to-end distributed benchmark (Kafka -> Worker -> PostgreSQL)
+benchmark-e2e: build
+	./bin/benchmark -mode=e2e -rate=$(or $(RATE),1000) -duration=5s
 
 # Build multi-stage Docker image
 docker-build:

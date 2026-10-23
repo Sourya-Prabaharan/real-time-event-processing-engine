@@ -21,16 +21,25 @@ func NewEventStore(db *sql.DB) *EventStore {
 // This makes the insert idempotent: if a worker crashes after inserting but
 // before committing the Kafka offset, the redelivered message will be safely
 // ignored instead of creating a duplicate row.
-func (s *EventStore) InsertEvent(ctx context.Context, e *events.Event) error {
-	_, err := s.db.ExecContext(ctx, `
+//
+// Returns (inserted = true, nil) if a new event row was inserted.
+// Returns (inserted = false, nil) if the event already existed (conflict ignored).
+func (s *EventStore) InsertEvent(ctx context.Context, e *events.Event) (bool, error) {
+	res, err := s.db.ExecContext(ctx, `
 		INSERT INTO events (id, event_type, user_id, product_id, price, quantity, category, created_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		ON CONFLICT (id) DO NOTHING
 	`, e.ID, e.Type, e.UserID, e.ProductID, e.Price, e.Quantity, e.Category, e.Timestamp)
 	if err != nil {
-		return fmt.Errorf("insert event %s: %w", e.ID, err)
+		return false, fmt.Errorf("insert event %s: %w", e.ID, err)
 	}
-	return nil
+
+	rows, err := res.RowsAffected()
+	if err != nil {
+		// If driver doesn't support RowsAffected, assume inserted to be safe
+		return true, nil
+	}
+	return rows > 0, nil
 }
 
 // GetRecentEvents returns the most recent events, ordered by creation time.

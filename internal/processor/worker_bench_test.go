@@ -55,7 +55,7 @@ func BenchmarkWorker_ProcessEventDirect(b *testing.B) {
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		_ = store.InsertEvent(ctx, evt)
+		_, _ = store.InsertEvent(ctx, evt)
 		w.latencies.Record(100 * time.Microsecond)
 	}
 }
