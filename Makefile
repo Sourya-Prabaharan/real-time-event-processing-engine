@@ -41,13 +41,17 @@ test-race:
 bench:
 	go test ./... -bench=. -benchmem -run=^$$
 
-# Run multi-tier in-memory pipeline benchmark (1k, 5k, 10k events/sec)
+# Run multi-tier benchmark (auto-detects live infra for E2E or runs in-memory baseline)
 benchmark: build
-	./bin/benchmark -mode=in-memory -all-tiers
+	./bin/benchmark -all-tiers
 
-# Run end-to-end distributed benchmark (Kafka -> Worker -> PostgreSQL)
+# Run genuine end-to-end distributed benchmark (Kafka -> Worker -> PostgreSQL)
 benchmark-e2e: build
-	./bin/benchmark -mode=e2e -rate=$(or $(RATE),1000) -duration=5s
+	./bin/benchmark -mode=e2e -all-tiers
+
+# Run in-memory pipeline baseline benchmark (Go concurrency & channel backpressure)
+benchmark-inmemory: build
+	./bin/benchmark -mode=in-memory -all-tiers
 
 # Build multi-stage Docker image
 docker-build:

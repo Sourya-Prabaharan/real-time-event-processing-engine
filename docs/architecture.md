@@ -11,16 +11,29 @@ StreamFlow processes real-time e-commerce activity (product views, cart addition
 ![StreamFlow Architecture](images/architecture.svg)
 
 ```mermaid
-flowchart LR
-    P["Event Producer<br/>(Weighted RNG)"] -->|"Key: product_id"| K["Apache Kafka<br/>(6 Partitions)"]
-    K -->|"Partition-pinned dispatch"| W["Go Worker Pool<br/>(Bounded Concurrency)"]
-    W -->|"Idempotent ON CONFLICT"| DB[("PostgreSQL 16<br/>Durable Source of Truth")]
-    W -->|"Pipelined Updates"| R[("Redis 7<br/>Real-Time Cache")]
-    W -->|"Poison Pills"| DLQ["Dead-Letter Queue<br/>(DB + events-dlq)"]
-    API["Go HTTP API & Console"] --> DB
-    API --> R
-    PROM["Prometheus Scraper"] -->|"/metrics"| API
-    G["Grafana"] --> PROM
+flowchart TD
+    subgraph Ingestion["1. Ingestion Layer"]
+        P["Event Producer (cmd/producer)"] -->|"key: product_id"| K["Apache Kafka Broker (6 Partitions)"]
+    end
+
+    subgraph Processing["2. Stream Processing Layer"]
+        K -->|"FetchMessage"| D["Partition Dispatcher"]
+        D -->|"partition-pinned routing"| W["Worker Pool (16 Goroutines)"]
+    end
+
+    subgraph Storage["3. Persistence & Caching"]
+        W -->|"Idempotent Insert"| PG[("PostgreSQL 16 Store")]
+        W -->|"Pipelined Counters"| RD[("Redis 7 Cache")]
+        W -->|"Poison Pills"| DLQ["Dead-Letter Queue (DLQ)"]
+        W -->|"CommitMessage"| K
+    end
+
+    subgraph Observability["4. Metrics & Monitoring"]
+        API["Go HTTP Server (:8080)"] --> PG
+        API --> RD
+        PROM["Prometheus (:9090)"] -->|"Scrape /metrics"| API
+        GRAF["Grafana (:3000)"] --> PROM
+    end
 ```
 
 ---

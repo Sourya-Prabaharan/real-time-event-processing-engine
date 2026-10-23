@@ -63,7 +63,7 @@ services:
     volumes:
       - ./deployments/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
       - ./deployments/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
-      - ./deployments/grafana/dashboards:/etc/grafana/provisioning/dashboards/json:ro
+      - ./deployments/grafana/dashboards:/var/lib/grafana/dashboards:ro
 
 volumes:
   pgdata:

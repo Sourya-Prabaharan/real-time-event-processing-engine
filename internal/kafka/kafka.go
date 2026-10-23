@@ -23,6 +23,10 @@ type Message = kafka.Message
 // auto-create on the broker and manage topics explicitly so the partition
 // count is intentional, not accidental.
 func EnsureTopic(ctx context.Context, brokers []string, partitions int) error {
+	return EnsureCustomTopic(ctx, brokers, Topic, partitions)
+}
+
+func EnsureCustomTopic(ctx context.Context, brokers []string, topic string, partitions int) error {
 	conn, err := kafka.DialContext(ctx, "tcp", brokers[0])
 	if err != nil {
 		return fmt.Errorf("dial kafka: %w", err)
@@ -31,7 +35,7 @@ func EnsureTopic(ctx context.Context, brokers []string, partitions int) error {
 
 	topicConfigs := []kafka.TopicConfig{
 		{
-			Topic:             Topic,
+			Topic:             topic,
 			NumPartitions:     partitions,
 			ReplicationFactor: 1,
 		},
@@ -43,9 +47,6 @@ func EnsureTopic(ctx context.Context, brokers []string, partitions int) error {
 	}
 	err = conn.CreateTopics(topicConfigs...)
 	if err != nil {
-		// kafka-go returns an error even if the topic already exists;
-		// there's no clean way to distinguish "already exists" from real errors
-		// in all cases, so we log and continue.
 		slog.Warn("create topics (may already exist)", "error", err)
 	}
 	return nil
@@ -55,19 +56,23 @@ func EnsureTopic(ctx context.Context, brokers []string, partitions int) error {
 // for publishing serialized events.
 type Producer struct {
 	writer *kafka.Writer
+	topic  string
 }
 
 func NewProducer(brokers []string) *Producer {
+	return NewProducerForTopic(brokers, Topic)
+}
+
+func NewProducerForTopic(brokers []string, topic string) *Producer {
 	w := &kafka.Writer{
 		Addr:         kafka.TCP(brokers...),
-		Topic:        Topic,
 		Balancer:     &kafka.Hash{}, // partition by key
 		RequiredAcks: kafka.RequireOne,
 		// BatchTimeout and BatchSize allow configurable batching
 		BatchTimeout: 10 * time.Millisecond,
 		BatchSize:    100,
 	}
-	return &Producer{writer: w}
+	return &Producer{writer: w, topic: topic}
 }
 
 // Publish sends a single event to Kafka. The key is the product ID,
@@ -76,10 +81,20 @@ func NewProducer(brokers []string) *Producer {
 // and purchase sequences.
 func (p *Producer) Publish(ctx context.Context, key string, value []byte) error {
 	return p.writer.WriteMessages(ctx, kafka.Message{
-		Topic: Topic,
+		Topic: p.topic,
 		Key:   []byte(key),
 		Value: value,
 	})
+}
+
+// PublishBatch writes a batch of messages to Kafka in a single network round-trip.
+func (p *Producer) PublishBatch(ctx context.Context, messages []kafka.Message) error {
+	for i := range messages {
+		if messages[i].Topic == "" {
+			messages[i].Topic = p.topic
+		}
+	}
+	return p.writer.WriteMessages(ctx, messages...)
 }
 
 // PublishDLQ forwards an unprocessable or poison-pill message to the dead-letter topic.
@@ -106,15 +121,23 @@ type Consumer struct {
 }
 
 func NewConsumer(brokers []string, groupID string) *Consumer {
+	return NewConsumerForTopic(brokers, groupID, Topic)
+}
+
+func NewConsumerForTopic(brokers []string, groupID string, topic string) *Consumer {
+	return NewConsumerWithOffset(brokers, groupID, topic, kafka.FirstOffset)
+}
+
+func NewConsumerWithOffset(brokers []string, groupID string, topic string, startOffset int64) *Consumer {
 	r := kafka.NewReader(kafka.ReaderConfig{
 		Brokers:        brokers,
-		Topic:          Topic,
+		Topic:          topic,
 		GroupID:        groupID,
 		MinBytes:       1,
 		MaxBytes:       10e6, // 10 MB
 		CommitInterval: time.Second,
 		// StartOffset only matters when the group has no committed offset.
-		StartOffset: kafka.FirstOffset,
+		StartOffset: startOffset,
 	})
 	return &Consumer{reader: r}
 }

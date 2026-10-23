@@ -52,11 +52,16 @@ func TestLiveContainerIntegration(t *testing.T) {
 	store := storage.NewEventStore(db)
 	dlqStore := storage.NewDLQStore(db)
 
+	testTopic := fmt.Sprintf("live-test-%d", time.Now().UnixNano()%100000)
+	if err := streamkafka.EnsureCustomTopic(ctx, []string{testBroker}, testTopic, 2); err != nil {
+		t.Skipf("Kafka unavailable at %s: %v", testBroker, err)
+	}
+
 	testGroupID := fmt.Sprintf("live-test-group-%d", time.Now().UnixNano())
-	consumer := streamkafka.NewConsumer([]string{testBroker}, testGroupID)
+	consumer := streamkafka.NewConsumerForTopic([]string{testBroker}, testGroupID, testTopic)
 	defer consumer.Close()
 
-	producer := streamkafka.NewProducer([]string{testBroker})
+	producer := streamkafka.NewProducerForTopic([]string{testBroker}, testTopic)
 	defer producer.Close()
 
 	// Start worker pool
@@ -132,7 +137,7 @@ func TestLiveContainerIntegration(t *testing.T) {
 	for time.Now().Before(dlqDeadline) {
 		dlqEntries, _ := dlqStore.GetRecentDeadLetters(ctx, 5)
 		for _, e := range dlqEntries {
-			if e.Topic == streamkafka.Topic {
+			if e.Topic == testTopic || e.Topic == streamkafka.Topic {
 				dlqFound = true
 				break
 			}

@@ -15,15 +15,15 @@ CREATE TABLE IF NOT EXISTS events (
 
 -- Index on event_type: used by analytics queries that filter/aggregate by type
 -- (e.g., "count purchases in the last minute").
-CREATE INDEX idx_events_type ON events(event_type);
+CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);
 
 -- Index on product_id: used by top-products queries and per-product lookups.
-CREATE INDEX idx_events_product_id ON events(product_id);
+CREATE INDEX IF NOT EXISTS idx_events_product_id ON events(product_id);
 
 -- Index on created_at: used by time-range queries for dashboards and throughput calculations.
-CREATE INDEX idx_events_created_at ON events(created_at);
+CREATE INDEX IF NOT EXISTS idx_events_created_at ON events(created_at);
 
 -- Composite index on (event_type, created_at): covers the most common analytics query pattern
 -- "give me all purchases in the last N minutes" without needing to scan the full type index
 -- and then filter by time.
-CREATE INDEX idx_events_type_created ON events(event_type, created_at);
+CREATE INDEX IF NOT EXISTS idx_events_type_created ON events(event_type, created_at);
