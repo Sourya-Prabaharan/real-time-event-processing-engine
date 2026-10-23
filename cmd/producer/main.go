@@ -14,10 +14,27 @@ import (
 	streamkafka "github.com/sourya/streamflow/internal/kafka"
 )
 
+func envOr(key, fallback string) string {
+	if val := os.Getenv(key); val != "" {
+		return val
+	}
+	return fallback
+}
+
+func envInt(key string, fallback int) int {
+	if val := os.Getenv(key); val != "" {
+		var n int
+		if _, err := fmt.Sscanf(val, "%d", &n); err == nil && n > 0 {
+			return n
+		}
+	}
+	return fallback
+}
+
 func main() {
 	var (
-		broker = flag.String("broker", "localhost:9092", "Kafka broker address")
-		rate   = flag.Int("rate", 100, "Events per second")
+		broker = flag.String("broker", envOr("KAFKA_BROKER", "localhost:9092"), "Kafka broker address")
+		rate   = flag.Int("rate", envInt("PRODUCE_RATE", 100), "Events per second")
 		seed   = flag.Int64("seed", 0, "Random seed (0 = use current time)")
 		count  = flag.Int("count", 0, "Total events to produce (0 = unlimited)")
 	)

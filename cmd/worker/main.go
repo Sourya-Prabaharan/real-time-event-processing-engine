@@ -15,14 +15,31 @@ import (
 	"github.com/sourya/streamflow/internal/storage"
 )
 
+func envOr(key, fallback string) string {
+	if val := os.Getenv(key); val != "" {
+		return val
+	}
+	return fallback
+}
+
+func envInt(key string, fallback int) int {
+	if val := os.Getenv(key); val != "" {
+		var n int
+		if _, err := fmt.Sscanf(val, "%d", &n); err == nil && n > 0 {
+			return n
+		}
+	}
+	return fallback
+}
+
 func main() {
 	var (
-		broker     = flag.String("broker", "localhost:9092", "Kafka broker address")
-		dbDSN      = flag.String("db", "postgres://streamflow:streamflow@localhost:5432/streamflow?sslmode=disable", "PostgreSQL DSN")
-		redisAddr  = flag.String("redis", "localhost:6379", "Redis address")
-		migrations = flag.String("migrations", "migrations", "Path to migration files")
-		group      = flag.String("group", "streamflow-workers", "Kafka consumer group ID")
-		workers    = flag.Int("workers", 4, "Number of concurrent processing goroutines")
+		broker     = flag.String("broker", envOr("KAFKA_BROKER", "localhost:9092"), "Kafka broker address")
+		dbDSN      = flag.String("db", envOr("POSTGRES_DSN", "postgres://streamflow:streamflow@localhost:5432/streamflow?sslmode=disable"), "PostgreSQL DSN")
+		redisAddr  = flag.String("redis", envOr("REDIS_ADDR", "localhost:6379"), "Redis address")
+		migrations = flag.String("migrations", envOr("MIGRATIONS_PATH", "migrations"), "Path to migration files")
+		group      = flag.String("group", envOr("CONSUMER_GROUP", "streamflow-workers"), "Kafka consumer group ID")
+		workers    = flag.Int("workers", envInt("WORKERS_COUNT", 4), "Number of concurrent processing goroutines")
 	)
 	flag.Parse()
 

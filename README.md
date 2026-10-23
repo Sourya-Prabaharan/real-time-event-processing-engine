@@ -1,5 +1,9 @@
 # StreamFlow — Real-Time Event Processing Platform
 
+[![CI](https://github.com/Sourya-Prabaharan/real-time-event-processing-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/Sourya-Prabaharan/real-time-event-processing-engine/actions/workflows/ci.yml)
+![Go Version](https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat&logo=go)
+![License](https://img.shields.io/badge/license-MIT-blue.svg)
+
 StreamFlow is a real-time event streaming and analytics backend written in Go. It ingests, processes, stores, and monitors high-throughput e-commerce event streams using Apache Kafka, PostgreSQL, Redis, and Prometheus.
 
 ---

@@ -20,12 +20,19 @@ import (
 	"github.com/sourya/streamflow/internal/web"
 )
 
+func envOr(key, fallback string) string {
+	if val := os.Getenv(key); val != "" {
+		return val
+	}
+	return fallback
+}
+
 func main() {
 	var (
-		addr       = flag.String("addr", ":8080", "HTTP listen address")
-		dbDSN      = flag.String("db", "postgres://streamflow:streamflow@localhost:5432/streamflow?sslmode=disable", "PostgreSQL DSN")
-		redisAddr  = flag.String("redis", "localhost:6379", "Redis address")
-		migrations = flag.String("migrations", "migrations", "Path to migration files")
+		addr       = flag.String("addr", envOr("HTTP_ADDR", ":8080"), "HTTP listen address")
+		dbDSN      = flag.String("db", envOr("POSTGRES_DSN", "postgres://streamflow:streamflow@localhost:5432/streamflow?sslmode=disable"), "PostgreSQL DSN")
+		redisAddr  = flag.String("redis", envOr("REDIS_ADDR", "localhost:6379"), "Redis address")
+		migrations = flag.String("migrations", envOr("MIGRATIONS_PATH", "migrations"), "Path to migration files")
 	)
 	flag.Parse()
 

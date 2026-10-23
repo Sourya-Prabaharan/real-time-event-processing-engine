@@ -1,6 +1,6 @@
-.PHONY: build run-infra stop-infra produce work api test bench benchmark fmt clean
+.PHONY: build run-infra stop-infra produce work api test test-race bench benchmark fmt clean docker-build
 
-# Build all binaries
+# Build all binaries locally
 build:
 	go build -o bin/producer ./cmd/producer
 	go build -o bin/worker ./cmd/worker
@@ -33,6 +33,10 @@ api: build
 test:
 	go test ./... -v -count=1
 
+# Run tests with race detector enabled
+test-race:
+	go test -race ./... -v -count=1
+
 # Run Go standard benchmarks with allocations
 bench:
 	go test ./... -bench=. -benchmem -run=^$$
@@ -40,6 +44,10 @@ bench:
 # Run multi-tier load-testing benchmark engine (1k, 5k, 10k events/sec)
 benchmark: build
 	./bin/benchmark -all-tiers
+
+# Build multi-stage Docker image
+docker-build:
+	docker build -t streamflow:latest .
 
 # Format and vet code
 fmt:

@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    name: Test & Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          check-latest: true
+
+      - name: Verify Dependencies
+        run: |
+          go mod verify
+          git diff --exit-code go.mod go.sum
+
+      - name: Code Formatting Check
+        run: |
+          if [ -n "$(gofmt -l .)" ]; then
+            echo "The following files are not formatted with gofmt:"
+            gofmt -l .
+            exit 1
+          fi
+
+      - name: Go Vet
+        run: go vet ./...
+
+      - name: Run Unit & Reliability Tests (with Race Detector)
+        run: go test -race -v -count=1 ./...
+
+      - name: Run Microbenchmarks
+        run: go test -bench=. -benchmem -run=^$ ./...
+
+      - name: Build All Binaries
+        run: |
+          mkdir -p bin
+          go build -v -o bin/producer ./cmd/producer
+          go build -v -o bin/worker ./cmd/worker
+          go build -v -o bin/api ./cmd/api
+          go build -v -o bin/benchmark ./cmd/benchmark
